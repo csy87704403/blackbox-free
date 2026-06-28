@@ -34,3 +34,32 @@ func TestShouldFallbackKimi(t *testing.T) {
 		}
 	}
 }
+
+func TestModelRoute(t *testing.T) {
+	tests := map[string]string{
+		"":                   minimaxModelAlias,
+		minimaxModelAlias:    minimaxModelAlias,
+		minimaxUpstreamModel: minimaxModelAlias,
+		kimiModelAlias:       kimiModelAlias,
+		kimiUpstreamModel:    kimiModelAlias,
+		"other":              "",
+	}
+	for input, want := range tests {
+		if got := modelRoute(input); got != want {
+			t.Fatalf("modelRoute(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestResponseModelExtraction(t *testing.T) {
+	const model = "gpt-5.4-nano-2026-03-17"
+	if got := responseModelFromJSON([]byte(`{"model":"` + model + `"}`)); got != model {
+		t.Fatalf("responseModelFromJSON = %q, want %q", got, model)
+	}
+	if got := responseModelFromSSELine([]byte("data: {\"model\":\"" + model + "\"}\n")); got != model {
+		t.Fatalf("responseModelFromSSELine = %q, want %q", got, model)
+	}
+	if got := responseModelFromSSELine([]byte("data: [DONE]\n")); got != "" {
+		t.Fatalf("DONE model = %q, want empty", got)
+	}
+}

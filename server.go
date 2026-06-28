@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -16,17 +18,19 @@ import (
 )
 
 type bridgeServer struct {
-	cfg       config
-	client    *http.Client
-	startedAt time.Time
-	semaphore chan struct{}
-	active    atomic.Int64
-	total     atomic.Int64
-	failures  atomic.Int64
-	metricsMu sync.RWMutex
-	last      requestMetrics
-	probeMu   sync.Mutex
-	probe     probeResult
+	cfg        config
+	client     *http.Client
+	startedAt  time.Time
+	semaphore  chan struct{}
+	active     atomic.Int64
+	total      atomic.Int64
+	failures   atomic.Int64
+	metricsMu  sync.RWMutex
+	last       requestMetrics
+	probeMu    sync.Mutex
+	probe      probeResult
+	routesMu   sync.RWMutex
+	routeState map[string]routeResolution
 }
 
 type requestMetrics struct {
@@ -44,12 +48,22 @@ type probeResult struct {
 	Error     string    `json:"error,omitempty"`
 }
 
+type routeResolution struct {
+	Route             string `json:"route"`
+	LastResolvedModel string `json:"last_resolved_model,omitempty"`
+	ResolvedAt        string `json:"resolved_at,omitempty"`
+}
+
 func newBridgeServer(cfg config) *bridgeServer {
 	return &bridgeServer{
 		cfg:       cfg,
 		client:    &http.Client{},
 		startedAt: time.Now(),
 		semaphore: make(chan struct{}, cfg.maxConcurrent),
+		routeState: map[string]routeResolution{
+			minimaxModelAlias: {Route: minimaxModelAlias},
+			kimiModelAlias:    {Route: kimiModelAlias},
+		},
 	}
 }
 
@@ -102,6 +116,7 @@ func (s *bridgeServer) handleHealthDetails(w http.ResponseWriter, r *http.Reques
 		"failures_total":  s.failures.Load(),
 		"last_request":    last,
 		"upstream":        s.probeUpstream(r.Context()),
+		"routes":          s.routeStatuses(),
 		"limits": map[string]any{
 			"max_concurrent":    s.cfg.maxConcurrent,
 			"max_request_bytes": s.cfg.maxRequestBytes,
@@ -163,6 +178,7 @@ func (s *bridgeServer) proxyChat(w http.ResponseWriter, r *http.Request) (int, e
 		return http.StatusBadRequest, decoderErr
 	}
 	requestedModel, _ := payload["model"].(string)
+	route := modelRoute(requestedModel)
 	payload["model"] = mapModel(payload["model"])
 	if err := expandReasonixImages(payload, s.cfg); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"message": "Invalid image attachment"}})
@@ -204,9 +220,20 @@ func (s *bridgeServer) proxyChat(w http.ResponseWriter, r *http.Request) (int, e
 	w.WriteHeader(response.StatusCode)
 	stream, _ := payload["stream"].(bool)
 	if stream {
-		err = copyStream(w, response.Body)
+		err = copyStream(w, response.Body, func(model string) {
+			if response.StatusCode >= 200 && response.StatusCode < 300 {
+				s.updateRouteResolution(route, model)
+			}
+		})
 	} else {
-		_, err = io.Copy(w, response.Body)
+		var responseBody []byte
+		responseBody, err = io.ReadAll(response.Body)
+		if err == nil {
+			if response.StatusCode >= 200 && response.StatusCode < 300 {
+				s.updateRouteResolution(route, responseModelFromJSON(responseBody))
+			}
+			_, err = w.Write(responseBody)
+		}
 	}
 	return response.StatusCode, err
 }
@@ -225,6 +252,17 @@ func mapModel(value any) string {
 
 func isKimiModel(model string) bool {
 	return model == kimiModelAlias || model == kimiUpstreamModel
+}
+
+func modelRoute(model string) string {
+	switch model {
+	case "", minimaxModelAlias, "minimax-m2", minimaxUpstreamModel:
+		return minimaxModelAlias
+	case kimiModelAlias, kimiUpstreamModel:
+		return kimiModelAlias
+	default:
+		return ""
+	}
 }
 
 func shouldFallbackKimi(status int) bool {
@@ -256,13 +294,16 @@ func copyResponseHeaders(target, source http.Header) {
 	}
 }
 
-func copyStream(w http.ResponseWriter, source io.Reader) error {
+func copyStream(w http.ResponseWriter, source io.Reader, onModel func(string)) error {
 	flusher, _ := w.(http.Flusher)
-	buffer := make([]byte, 32*1024)
+	reader := bufio.NewReader(source)
 	for {
-		count, err := source.Read(buffer)
-		if count > 0 {
-			if _, writeErr := w.Write(buffer[:count]); writeErr != nil {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			if model := responseModelFromSSELine(line); model != "" && onModel != nil {
+				onModel(model)
+			}
+			if _, writeErr := w.Write(line); writeErr != nil {
 				return writeErr
 			}
 			if flusher != nil {
@@ -276,6 +317,47 @@ func copyStream(w http.ResponseWriter, source io.Reader) error {
 			return err
 		}
 	}
+}
+
+func responseModelFromJSON(body []byte) string {
+	var value struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(body, &value) != nil {
+		return ""
+	}
+	return strings.TrimSpace(value.Model)
+}
+
+func responseModelFromSSELine(line []byte) string {
+	line = bytes.TrimSpace(line)
+	if !bytes.HasPrefix(line, []byte("data:")) {
+		return ""
+	}
+	data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+	if bytes.Equal(data, []byte("[DONE]")) {
+		return ""
+	}
+	return responseModelFromJSON(data)
+}
+
+func (s *bridgeServer) updateRouteResolution(route, model string) {
+	if route == "" || model == "" {
+		return
+	}
+	s.routesMu.Lock()
+	s.routeState[route] = routeResolution{
+		Route:             route,
+		LastResolvedModel: model,
+		ResolvedAt:        time.Now().UTC().Format(time.RFC3339),
+	}
+	s.routesMu.Unlock()
+}
+
+func (s *bridgeServer) routeStatuses() []routeResolution {
+	s.routesMu.RLock()
+	defer s.routesMu.RUnlock()
+	return []routeResolution{s.routeState[minimaxModelAlias], s.routeState[kimiModelAlias]}
 }
 
 func (s *bridgeServer) recordRequest(status int, latency time.Duration, err error) {
