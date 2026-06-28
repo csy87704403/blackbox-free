@@ -1,0 +1,25 @@
+services:
+  bridge:
+    build: .
+    image: blackbox-minimax-bridge:local
+    restart: unless-stopped
+    ports:
+      - "${BRIDGE_BIND_IP:-127.0.0.1}:${BRIDGE_PORT:-39281}:39281"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 39281
+      BLACKBOX_USER_ID: ${BLACKBOX_USER_ID:?BLACKBOX_USER_ID is required}
+      BLACKBOX_GATEWAY_API_KEY: ${BLACKBOX_GATEWAY_API_KEY:-xxx}
+      BRIDGE_API_KEY: ${BRIDGE_API_KEY:?BRIDGE_API_KEY is required}
+      UPSTREAM_TIMEOUT_MS: ${UPSTREAM_TIMEOUT_MS:-180000}
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-26214400}
+      MAX_IMAGE_BYTES: ${MAX_IMAGE_BYTES:-10485760}
+      MAX_CONCURRENT: ${MAX_CONCURRENT:-4}
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m
+    mem_limit: 128m

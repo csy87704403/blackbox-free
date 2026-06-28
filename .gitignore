@@ -1,0 +1,9 @@
+node_modules/
+bin/
+docker/
+src/
+package.json
+*.log
+*.exe
+.env
+.env.*

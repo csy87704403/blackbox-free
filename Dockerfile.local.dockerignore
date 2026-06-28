@@ -1,0 +1,7 @@
+node_modules
+bin
+*.log
+*.exe
+.git
+src
+package.json

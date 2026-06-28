@@ -1,0 +1,9 @@
+services:
+  bridge:
+    environment:
+      REASONIX_WORKSPACE: /data/reasonix
+    volumes:
+      - type: bind
+        source: ${REASONIX_WORKSPACE_HOST:?REASONIX_WORKSPACE_HOST is required}
+        target: /data/reasonix
+        read_only: true
