@@ -12,8 +12,11 @@ import (
 )
 
 const (
-	modelAlias    = "blackbox/minimax-m2.7"
-	upstreamModel = "openrouter/minimax-m2-thinking"
+	minimaxModelAlias    = "blackbox/minimax-m2.7"
+	minimaxUpstreamModel = "openrouter/minimax-m2-thinking"
+	kimiModelAlias       = "blackbox/kimi-k2.6"
+	kimiUpstreamModel    = "moonshotai/kimi-k2.6"
+	kimiFallbackModel    = "gpt-4o-mini"
 )
 
 type config struct {

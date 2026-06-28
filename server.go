@@ -81,7 +81,8 @@ func (s *bridgeServer) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 func (s *bridgeServer) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":              true,
-		"model":           modelAlias,
+		"model":           minimaxModelAlias,
+		"models":          []string{minimaxModelAlias, kimiModelAlias},
 		"uptime_seconds":  int64(time.Since(s.startedAt).Seconds()),
 		"active_requests": s.active.Load(),
 	})
@@ -93,7 +94,8 @@ func (s *bridgeServer) handleHealthDetails(w http.ResponseWriter, r *http.Reques
 	s.metricsMu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":              true,
-		"model":           modelAlias,
+		"model":           minimaxModelAlias,
+		"models":          []string{minimaxModelAlias, kimiModelAlias},
 		"uptime_seconds":  int64(time.Since(s.startedAt).Seconds()),
 		"active_requests": s.active.Load(),
 		"requests_total":  s.total.Load(),
@@ -118,9 +120,10 @@ func (s *bridgeServer) handleHealthDetails(w http.ResponseWriter, r *http.Reques
 func (s *bridgeServer) handleModels(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data": []any{map[string]any{
-			"id": modelAlias, "object": "model", "created": 0, "owned_by": "blackbox",
-		}},
+		"data": []any{
+			map[string]any{"id": minimaxModelAlias, "object": "model", "created": 0, "owned_by": "blackbox"},
+			map[string]any{"id": kimiModelAlias, "object": "model", "created": 0, "owned_by": "blackbox"},
+		},
 	})
 }
 
@@ -159,6 +162,7 @@ func (s *bridgeServer) proxyChat(w http.ResponseWriter, r *http.Request) (int, e
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"message": "Invalid JSON"}})
 		return http.StatusBadRequest, decoderErr
 	}
+	requestedModel, _ := payload["model"].(string)
 	payload["model"] = mapModel(payload["model"])
 	if err := expandReasonixImages(payload, s.cfg); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"message": "Invalid image attachment"}})
@@ -172,18 +176,7 @@ func (s *bridgeServer) proxyChat(w http.ResponseWriter, r *http.Request) (int, e
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.upstreamTimeout)
 	defer cancel()
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.upstreamBaseURL+"/v1/chat/completions", strings.NewReader(string(normalized)))
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]string{"message": "Upstream request failed"}})
-		return http.StatusBadGateway, err
-	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Accept", "application/json")
-	request.Header.Set("Authorization", "Bearer "+s.cfg.blackboxGatewayKey)
-	request.Header.Set("userId", s.cfg.blackboxUserID)
-	request.Header.Set("version", "1.1")
-
-	response, err := s.client.Do(request)
+	response, err := s.sendUpstream(ctx, normalized)
 	if err != nil {
 		status := http.StatusBadGateway
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -191,6 +184,19 @@ func (s *bridgeServer) proxyChat(w http.ResponseWriter, r *http.Request) (int, e
 		}
 		writeJSON(w, status, map[string]any{"error": map[string]string{"message": "Upstream request failed"}})
 		return status, err
+	}
+	if isKimiModel(requestedModel) && shouldFallbackKimi(response.StatusCode) {
+		_, _ = io.Copy(io.Discard, response.Body)
+		response.Body.Close()
+		payload["model"] = kimiFallbackModel
+		normalized, err = json.Marshal(payload)
+		if err == nil {
+			response, err = s.sendUpstream(ctx, normalized)
+		}
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]string{"message": "Upstream fallback request failed"}})
+			return http.StatusBadGateway, err
+		}
 	}
 	defer response.Body.Close()
 
@@ -208,11 +214,38 @@ func (s *bridgeServer) proxyChat(w http.ResponseWriter, r *http.Request) (int, e
 func mapModel(value any) string {
 	model, _ := value.(string)
 	switch model {
-	case "", modelAlias, "minimax-m2", upstreamModel:
-		return upstreamModel
+	case "", minimaxModelAlias, "minimax-m2", minimaxUpstreamModel:
+		return minimaxUpstreamModel
+	case kimiModelAlias, kimiUpstreamModel:
+		return kimiUpstreamModel
 	default:
 		return model
 	}
+}
+
+func isKimiModel(model string) bool {
+	return model == kimiModelAlias || model == kimiUpstreamModel
+}
+
+func shouldFallbackKimi(status int) bool {
+	return status == http.StatusUnauthorized ||
+		status == http.StatusForbidden ||
+		status == http.StatusNotFound ||
+		status == http.StatusTooManyRequests ||
+		status >= http.StatusInternalServerError
+}
+
+func (s *bridgeServer) sendUpstream(ctx context.Context, body []byte) (*http.Response, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.upstreamBaseURL+"/v1/chat/completions", strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Authorization", "Bearer "+s.cfg.blackboxGatewayKey)
+	request.Header.Set("userId", s.cfg.blackboxUserID)
+	request.Header.Set("version", "1.1")
+	return s.client.Do(request)
 }
 
 func copyResponseHeaders(target, source http.Header) {
