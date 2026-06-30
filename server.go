@@ -49,9 +49,10 @@ type probeResult struct {
 }
 
 type routeResolution struct {
-	Route             string `json:"route"`
-	LastResolvedModel string `json:"last_resolved_model,omitempty"`
-	ResolvedAt        string `json:"resolved_at,omitempty"`
+	Route               string `json:"route"`
+	LastResolvedModel   string `json:"last_resolved_model,omitempty"`
+	LastResolvedAPIBase string `json:"last_resolved_api_base,omitempty"`
+	ResolvedAt          string `json:"resolved_at,omitempty"`
 }
 
 func newBridgeServer(cfg config) *bridgeServer {
@@ -126,8 +127,12 @@ func (s *bridgeServer) handleHealthDetails(w http.ResponseWriter, r *http.Reques
 			"chat":                 true,
 			"stream":               true,
 			"tools":                true,
-			"images":               true,
+			"images":               false,
 			"reasonix_attachments": imageCapability(s.cfg),
+		},
+		"route_capabilities": map[string]any{
+			minimaxModelAlias: map[string]bool{"chat": true, "stream": true, "tools": true, "images": false},
+			kimiModelAlias:    map[string]bool{"chat": true, "stream": true, "tools": true, "images": true},
 		},
 	})
 }
@@ -192,7 +197,7 @@ func (s *bridgeServer) proxyChat(w http.ResponseWriter, r *http.Request) (int, e
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.upstreamTimeout)
 	defer cancel()
-	response, err := s.sendUpstream(ctx, normalized)
+	response, err := s.sendUpstream(ctx, route, normalized)
 	if err != nil {
 		status := http.StatusBadGateway
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -207,7 +212,7 @@ func (s *bridgeServer) proxyChat(w http.ResponseWriter, r *http.Request) (int, e
 		payload["model"] = kimiFallbackModel
 		normalized, err = json.Marshal(payload)
 		if err == nil {
-			response, err = s.sendUpstream(ctx, normalized)
+			response, err = s.sendUpstream(ctx, kimiModelAlias, normalized)
 		}
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]string{"message": "Upstream fallback request failed"}})
@@ -218,19 +223,24 @@ func (s *bridgeServer) proxyChat(w http.ResponseWriter, r *http.Request) (int, e
 
 	copyResponseHeaders(w.Header(), response.Header)
 	w.WriteHeader(response.StatusCode)
+	headerModel := strings.TrimSpace(response.Header.Get("x-litellm-model-id"))
+	resolvedAPIBase := strings.TrimSpace(response.Header.Get("x-litellm-model-api-base"))
+	if response.StatusCode >= 200 && response.StatusCode < 300 && headerModel != "" {
+		s.updateRouteResolution(route, headerModel, resolvedAPIBase)
+	}
 	stream, _ := payload["stream"].(bool)
 	if stream {
 		err = copyStream(w, response.Body, func(model string) {
-			if response.StatusCode >= 200 && response.StatusCode < 300 {
-				s.updateRouteResolution(route, model)
+			if response.StatusCode >= 200 && response.StatusCode < 300 && headerModel == "" {
+				s.updateRouteResolution(route, model, resolvedAPIBase)
 			}
 		})
 	} else {
 		var responseBody []byte
 		responseBody, err = io.ReadAll(response.Body)
 		if err == nil {
-			if response.StatusCode >= 200 && response.StatusCode < 300 {
-				s.updateRouteResolution(route, responseModelFromJSON(responseBody))
+			if response.StatusCode >= 200 && response.StatusCode < 300 && headerModel == "" {
+				s.updateRouteResolution(route, responseModelFromJSON(responseBody), resolvedAPIBase)
 			}
 			_, err = w.Write(responseBody)
 		}
@@ -241,7 +251,7 @@ func (s *bridgeServer) proxyChat(w http.ResponseWriter, r *http.Request) (int, e
 func mapModel(value any) string {
 	model, _ := value.(string)
 	switch model {
-	case "", minimaxModelAlias, "minimax-m2", minimaxUpstreamModel:
+	case "", minimaxModelAlias, "minimax-m2", minimaxUpstreamModel, legacyMinimaxModel:
 		return minimaxUpstreamModel
 	case kimiModelAlias, kimiUpstreamModel:
 		return kimiUpstreamModel
@@ -256,7 +266,7 @@ func isKimiModel(model string) bool {
 
 func modelRoute(model string) string {
 	switch model {
-	case "", minimaxModelAlias, "minimax-m2", minimaxUpstreamModel:
+	case "", minimaxModelAlias, "minimax-m2", minimaxUpstreamModel, legacyMinimaxModel:
 		return minimaxModelAlias
 	case kimiModelAlias, kimiUpstreamModel:
 		return kimiModelAlias
@@ -273,17 +283,33 @@ func shouldFallbackKimi(status int) bool {
 		status >= http.StatusInternalServerError
 }
 
-func (s *bridgeServer) sendUpstream(ctx context.Context, body []byte) (*http.Response, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.upstreamBaseURL+"/v1/chat/completions", strings.NewReader(string(body)))
+func (s *bridgeServer) sendUpstream(ctx context.Context, route string, body []byte) (*http.Response, error) {
+	request, err := s.buildUpstreamRequest(ctx, route, body)
+	if err != nil {
+		return nil, err
+	}
+	return s.client.Do(request)
+}
+
+func (s *bridgeServer) buildUpstreamRequest(ctx context.Context, route string, body []byte) (*http.Request, error) {
+	baseURL := s.cfg.upstreamBaseURL
+	apiKey := s.cfg.blackboxGatewayKey
+	if route == minimaxModelAlias {
+		baseURL = s.cfg.minimaxBaseURL
+		apiKey = s.cfg.minimaxAPIKey
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/chat/completions", strings.NewReader(string(body)))
 	if err != nil {
 		return nil, err
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json")
-	request.Header.Set("Authorization", "Bearer "+s.cfg.blackboxGatewayKey)
-	request.Header.Set("userId", s.cfg.blackboxUserID)
-	request.Header.Set("version", "1.1")
-	return s.client.Do(request)
+	request.Header.Set("Authorization", "Bearer "+apiKey)
+	if route != minimaxModelAlias {
+		request.Header.Set("userId", s.cfg.blackboxUserID)
+		request.Header.Set("version", "1.1")
+	}
+	return request, nil
 }
 
 func copyResponseHeaders(target, source http.Header) {
@@ -341,15 +367,16 @@ func responseModelFromSSELine(line []byte) string {
 	return responseModelFromJSON(data)
 }
 
-func (s *bridgeServer) updateRouteResolution(route, model string) {
+func (s *bridgeServer) updateRouteResolution(route, model, apiBase string) {
 	if route == "" || model == "" {
 		return
 	}
 	s.routesMu.Lock()
 	s.routeState[route] = routeResolution{
-		Route:             route,
-		LastResolvedModel: model,
-		ResolvedAt:        time.Now().UTC().Format(time.RFC3339),
+		Route:               route,
+		LastResolvedModel:   model,
+		LastResolvedAPIBase: apiBase,
+		ResolvedAt:          time.Now().UTC().Format(time.RFC3339),
 	}
 	s.routesMu.Unlock()
 }
@@ -382,7 +409,7 @@ func (s *bridgeServer) probeUpstream(ctx context.Context) probeResult {
 	started := time.Now()
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	request, _ := http.NewRequestWithContext(probeCtx, http.MethodHead, s.cfg.upstreamBaseURL+"/", nil)
+	request, _ := http.NewRequestWithContext(probeCtx, http.MethodHead, s.cfg.minimaxBaseURL+"/", nil)
 	response, err := s.client.Do(request)
 	result := probeResult{CheckedAt: time.Now().UTC(), LatencyMS: time.Since(started).Milliseconds()}
 	if err != nil {

@@ -11,6 +11,7 @@ func TestMapModel(t *testing.T) {
 		minimaxModelAlias:            minimaxUpstreamModel,
 		"minimax-m2":                 minimaxUpstreamModel,
 		minimaxUpstreamModel:         minimaxUpstreamModel,
+		legacyMinimaxModel:           minimaxUpstreamModel,
 		kimiModelAlias:               kimiUpstreamModel,
 		kimiUpstreamModel:            kimiUpstreamModel,
 		"caller-provided-model-name": "caller-provided-model-name",
@@ -40,6 +41,7 @@ func TestModelRoute(t *testing.T) {
 		"":                   minimaxModelAlias,
 		minimaxModelAlias:    minimaxModelAlias,
 		minimaxUpstreamModel: minimaxModelAlias,
+		legacyMinimaxModel:   minimaxModelAlias,
 		kimiModelAlias:       kimiModelAlias,
 		kimiUpstreamModel:    kimiModelAlias,
 		"other":              "",
@@ -48,6 +50,51 @@ func TestModelRoute(t *testing.T) {
 		if got := modelRoute(input); got != want {
 			t.Fatalf("modelRoute(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+func TestMinimaxUsesDedicatedUpstream(t *testing.T) {
+	server := newBridgeServer(config{
+		upstreamBaseURL:    "https://legacy.example",
+		minimaxBaseURL:     "https://api.blackbox.ai",
+		minimaxAPIKey:      "minimax-no-key-required",
+		blackboxUserID:     "legacy-user",
+		blackboxGatewayKey: "legacy-key",
+		maxConcurrent:      1,
+	})
+	request, err := server.buildUpstreamRequest(t.Context(), minimaxModelAlias, []byte(`{"model":"blackboxai/minimax/minimax-m2.7"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.URL.String() != "https://api.blackbox.ai/v1/chat/completions" {
+		t.Fatalf("Minimax URL = %q", request.URL.String())
+	}
+	if request.Header.Get("Authorization") != "Bearer minimax-no-key-required" {
+		t.Fatalf("Minimax authorization was not set")
+	}
+	if request.Header.Get("userId") != "" || request.Header.Get("version") != "" {
+		t.Fatalf("Minimax request must not include legacy identity headers")
+	}
+}
+
+func TestKimiUsesLegacyUpstream(t *testing.T) {
+	server := newBridgeServer(config{
+		upstreamBaseURL:    "https://legacy.example",
+		minimaxBaseURL:     "https://api.blackbox.ai",
+		minimaxAPIKey:      "minimax-no-key-required",
+		blackboxUserID:     "legacy-user",
+		blackboxGatewayKey: "legacy-key",
+		maxConcurrent:      1,
+	})
+	request, err := server.buildUpstreamRequest(t.Context(), kimiModelAlias, []byte(`{"model":"moonshotai/kimi-k2.6"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.URL.String() != "https://legacy.example/v1/chat/completions" {
+		t.Fatalf("Kimi URL = %q", request.URL.String())
+	}
+	if request.Header.Get("Authorization") != "Bearer legacy-key" || request.Header.Get("userId") != "legacy-user" || request.Header.Get("version") != "1.1" {
+		t.Fatalf("Kimi legacy headers were not preserved")
 	}
 }
 

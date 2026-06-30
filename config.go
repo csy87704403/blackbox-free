@@ -13,7 +13,8 @@ import (
 
 const (
 	minimaxModelAlias    = "blackbox/minimax-m2.7"
-	minimaxUpstreamModel = "openrouter/minimax-m2-thinking"
+	minimaxUpstreamModel = "blackboxai/minimax/minimax-m2.7"
+	legacyMinimaxModel   = "openrouter/minimax-m2-thinking"
 	kimiModelAlias       = "blackbox/kimi-k2.6"
 	kimiUpstreamModel    = "moonshotai/kimi-k2.6"
 	kimiFallbackModel    = "gpt-4o-mini"
@@ -23,6 +24,8 @@ type config struct {
 	host               string
 	port               int
 	upstreamBaseURL    string
+	minimaxBaseURL     string
+	minimaxAPIKey      string
 	upstreamTimeout    time.Duration
 	blackboxUserID     string
 	blackboxGatewayKey string
@@ -51,7 +54,9 @@ func loadConfig() (config, error) {
 		host:               envString("HOST", "127.0.0.1"),
 		port:               envInt("PORT", 39281),
 		upstreamBaseURL:    strings.TrimRight(envString("BLACKBOX_UPSTREAM_BASE_URL", "https://oi-vscode-server-985058387028.europe-west1.run.app"), "/"),
-		upstreamTimeout:    time.Duration(envInt("UPSTREAM_TIMEOUT_MS", 180000)) * time.Millisecond,
+		minimaxBaseURL:     strings.TrimRight(envString("BLACKBOX_MINIMAX_BASE_URL", "https://api.blackbox.ai"), "/"),
+		minimaxAPIKey:      envString("BLACKBOX_MINIMAX_API_KEY", "minimax-no-key-required"),
+		upstreamTimeout:    time.Duration(envInt("UPSTREAM_TIMEOUT_MS", 60000)) * time.Millisecond,
 		blackboxUserID:     userID,
 		blackboxGatewayKey: envString("BLACKBOX_GATEWAY_API_KEY", "xxx"),
 		bridgeAPIKey:       strings.TrimSpace(os.Getenv("BRIDGE_API_KEY")),
