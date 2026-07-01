@@ -97,7 +97,8 @@ func (s *bridgeServer) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":              true,
 		"model":           minimaxModelAlias,
-		"models":          []string{minimaxModelAlias, kimiModelAlias},
+		"models":          []string{minimaxModelAlias},
+		"disabled_models": []string{kimiModelAlias},
 		"uptime_seconds":  int64(time.Since(s.startedAt).Seconds()),
 		"active_requests": s.active.Load(),
 	})
@@ -110,7 +111,8 @@ func (s *bridgeServer) handleHealthDetails(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":              true,
 		"model":           minimaxModelAlias,
-		"models":          []string{minimaxModelAlias, kimiModelAlias},
+		"models":          []string{minimaxModelAlias},
+		"disabled_models": []string{kimiModelAlias},
 		"uptime_seconds":  int64(time.Since(s.startedAt).Seconds()),
 		"active_requests": s.active.Load(),
 		"requests_total":  s.total.Load(),
@@ -132,7 +134,6 @@ func (s *bridgeServer) handleHealthDetails(w http.ResponseWriter, r *http.Reques
 		},
 		"route_capabilities": map[string]any{
 			minimaxModelAlias: map[string]bool{"chat": true, "stream": true, "tools": true, "images": false},
-			kimiModelAlias:    map[string]bool{"chat": true, "stream": true, "tools": true, "images": true},
 		},
 	})
 }
@@ -142,7 +143,6 @@ func (s *bridgeServer) handleModels(w http.ResponseWriter, _ *http.Request) {
 		"object": "list",
 		"data": []any{
 			map[string]any{"id": minimaxModelAlias, "object": "model", "created": 0, "owned_by": "blackbox"},
-			map[string]any{"id": kimiModelAlias, "object": "model", "created": 0, "owned_by": "blackbox"},
 		},
 	})
 }
@@ -183,6 +183,16 @@ func (s *bridgeServer) proxyChat(w http.ResponseWriter, r *http.Request) (int, e
 		return http.StatusBadRequest, decoderErr
 	}
 	requestedModel, _ := payload["model"].(string)
+	if isKimiModel(requestedModel) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": map[string]string{
+				"message": "The blackbox/kimi-k2.6 route is temporarily unavailable",
+				"type":    "service_unavailable",
+				"code":    "model_route_disabled",
+			},
+		})
+		return http.StatusServiceUnavailable, errors.New("Kimi route is disabled")
+	}
 	route := modelRoute(requestedModel)
 	payload["model"] = mapModel(payload["model"])
 	if err := expandReasonixImages(payload, s.cfg); err != nil {
@@ -384,7 +394,7 @@ func (s *bridgeServer) updateRouteResolution(route, model, apiBase string) {
 func (s *bridgeServer) routeStatuses() []routeResolution {
 	s.routesMu.RLock()
 	defer s.routesMu.RUnlock()
-	return []routeResolution{s.routeState[minimaxModelAlias], s.routeState[kimiModelAlias]}
+	return []routeResolution{s.routeState[minimaxModelAlias]}
 }
 
 func (s *bridgeServer) recordRequest(status int, latency time.Duration, err error) {

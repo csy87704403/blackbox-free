@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
@@ -95,6 +98,41 @@ func TestKimiUsesLegacyUpstream(t *testing.T) {
 	}
 	if request.Header.Get("Authorization") != "Bearer legacy-key" || request.Header.Get("userId") != "legacy-user" || request.Header.Get("version") != "1.1" {
 		t.Fatalf("Kimi legacy headers were not preserved")
+	}
+}
+
+func TestModelsExcludesDisabledKimi(t *testing.T) {
+	server := newBridgeServer(config{maxConcurrent: 1})
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	recorder := httptest.NewRecorder()
+	server.routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("models status = %d", recorder.Code)
+	}
+	var response struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Data) != 1 || response.Data[0].ID != minimaxModelAlias {
+		t.Fatalf("models response = %+v", response.Data)
+	}
+}
+
+func TestDisabledKimiReturnsServiceUnavailable(t *testing.T) {
+	server := newBridgeServer(config{maxConcurrent: 1, maxRequestBytes: 1024})
+	body := []byte(`{"model":"blackbox/kimi-k2.6","messages":[{"role":"user","content":"hello"}]}`)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	recorder := httptest.NewRecorder()
+	server.routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("Kimi status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if !bytes.Contains(recorder.Body.Bytes(), []byte("model_route_disabled")) {
+		t.Fatalf("Kimi response = %s", recorder.Body.String())
 	}
 }
 
